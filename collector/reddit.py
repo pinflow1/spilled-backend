@@ -11,7 +11,7 @@ from utils.config import config
 class RedditCollector:
     def __init__(self):
         self.client = httpx.Client(
-            headers={"User-Agent": config.REDDIT_USER_AGENT},
+            headers={"User-Agent": config.REDDIT_USER_AGENT, "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
             timeout=15.0,
             follow_redirects=True,
         )
@@ -171,3 +171,4 @@ class RedditCollector:
 
     def close(self):
         self.client.close()
+        
