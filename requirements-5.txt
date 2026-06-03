@@ -1,0 +1,8 @@
+# spilled engine dependencies
+supabase==2.0.3
+httpx==0.23.3
+python-dotenv==1.0.0
+schedule==1.2.1
+loguru==0.7.2
+tenacity==8.3.0
+python-dateutil==2.9.0
