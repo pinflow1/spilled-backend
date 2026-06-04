@@ -1,0 +1,429 @@
+"""
+LLM-based narrative clustering using Groq.
+Sends batches of post titles to Groq and asks it to group them
+into related narratives. No local ML model needed.
+Production-grade quality at zero cost.
+"""
+import json
+import time
+import hashlib
+from datetime import datetime, timezone
+from loguru import logger
+from utils.config import config
+from utils.db import get_db
+import httpx
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+BATCH_SIZE = 20  # posts per clustering call
+MAX_RETRIES = 2
+
+
+def _call_groq(prompt: str, model: str = "llama3-8b-8192") -> str | None:
+    """Call Groq API. Uses 8b model for clustering — fast and cheap."""
+    try:
+        resp = httpx.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {config.GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1500,
+                "temperature": 0.1,  # low temp for consistent clustering
+            },
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.warning(f"Groq call failed: {e}")
+        return None
+
+
+def _call_gemini(prompt: str) -> str | None:
+    """Call Gemini for content generation."""
+    try:
+        resp = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={config.GEMINI_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 1200, "temperature": 0.7},
+            },
+            timeout=25.0,
+        )
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        logger.warning(f"Gemini call failed: {e}")
+        return None
+
+
+def _parse_json(text: str) -> dict | list | None:
+    """Safely parse JSON from LLM response."""
+    try:
+        clean = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
+    except Exception:
+        try:
+            # Find JSON block in response
+            import re
+            match = re.search(r'\{.*\}|\[.*\]', text, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+        except Exception:
+            pass
+    return None
+
+
+def cluster_with_groq(posts: list[dict]) -> list[dict]:
+    """
+    Use Groq to group posts into narrative clusters.
+    Processes in batches of BATCH_SIZE.
+    Returns list of cluster dicts.
+    """
+    if not posts:
+        return []
+
+    if not config.GROQ_API_KEY:
+        logger.warning("No GROQ_API_KEY — skipping LLM clustering")
+        return _fallback_clusters(posts)
+
+    all_clusters = []
+
+    # Process in batches
+    for i in range(0, len(posts), BATCH_SIZE):
+        batch = posts[i:i + BATCH_SIZE]
+        clusters = _cluster_batch(batch)
+        all_clusters.extend(clusters)
+        # Small delay between batches
+        if i + BATCH_SIZE < len(posts):
+            time.sleep(0.5)
+
+    # Merge clusters with same story across batches
+    merged = _merge_clusters(all_clusters)
+    logger.info(f"Clustering: {len(posts)} posts → {len(merged)} narratives")
+    return merged
+
+
+def _cluster_batch(posts: list[dict]) -> list[dict]:
+    """Cluster a single batch using Groq."""
+    numbered = "\n".join(
+        f"{i+1}. [{post.get('category','viral').upper()}] {post.get('title','')}"
+        for i, post in enumerate(posts)
+    )
+
+    prompt = f"""You are a narrative intelligence engine. Group these news headlines into related stories.
+
+Headlines:
+{numbered}
+
+Rules:
+- Group headlines that are about the SAME story or event
+- Different angles on the same story = same group
+- Unrelated stories = separate groups
+- Minimum 1 headline per group
+- Maximum 8 headlines per group
+
+Return ONLY a JSON array. No explanation. No markdown. Raw JSON only:
+[
+  {{
+    "group_id": 1,
+    "theme": "One sentence describing what this story is about",
+    "category": "celebrity|tech|music|sports|finance|viral|politics|gaming|creators",
+    "indices": [1, 3, 7]
+  }}
+]"""
+
+    for attempt in range(MAX_RETRIES):
+        result = _call_groq(prompt)
+        if not result:
+            time.sleep(2)
+            continue
+
+        parsed = _parse_json(result)
+        if not parsed or not isinstance(parsed, list):
+            time.sleep(1)
+            continue
+
+        # Convert to cluster dicts
+        clusters = []
+        for group in parsed:
+            indices = [i - 1 for i in group.get("indices", []) if 0 < i <= len(posts)]
+            if not indices:
+                continue
+
+            group_posts = [posts[i] for i in indices]
+            total_eng = sum(p.get("engagement", 0) for p in group_posts)
+            subreddits = list({p.get("subreddit", "") for p in group_posts})
+
+            # Representative post — highest engagement
+            rep = max(group_posts, key=lambda p: p.get("engagement", 0))
+
+            clusters.append({
+                "theme":           group.get("theme", rep.get("title", ""))[:500],
+                "category":        group.get("category", rep.get("category", "viral")),
+                "posts":           group_posts,
+                "subreddits":      subreddits,
+                "total_engagement": total_eng,
+                "representative_title": rep.get("title", ""),
+                "post_count":      len(group_posts),
+            })
+
+        if clusters:
+            return clusters
+
+    # Fallback if Groq fails
+    return _fallback_clusters(posts)
+
+
+def _merge_clusters(clusters: list[dict]) -> list[dict]:
+    """
+    Merge clusters from different batches that cover the same story.
+    Uses simple theme keyword overlap.
+    """
+    import re
+
+    def keywords(text):
+        stop = {"the","a","an","and","or","in","on","at","to","for","of","with","is","are"}
+        words = re.findall(r'\b[a-z]{4,}\b', text.lower())
+        return set(w for w in words if w not in stop)
+
+    merged = []
+    used = set()
+
+    for i, c1 in enumerate(clusters):
+        if i in used:
+            continue
+        kw1 = keywords(c1["theme"])
+        merged_cluster = dict(c1)
+        merged_cluster["posts"] = list(c1["posts"])
+
+        for j, c2 in enumerate(clusters[i+1:], i+1):
+            if j in used:
+                continue
+            kw2 = keywords(c2["theme"])
+            # If themes share 2+ keywords, merge
+            if len(kw1 & kw2) >= 2 and c1["category"] == c2["category"]:
+                merged_cluster["posts"].extend(c2["posts"])
+                merged_cluster["total_engagement"] += c2["total_engagement"]
+                merged_cluster["subreddits"] = list(
+                    set(merged_cluster["subreddits"]) | set(c2["subreddits"])
+                )
+                merged_cluster["post_count"] = len(merged_cluster["posts"])
+                used.add(j)
+
+        used.add(i)
+        merged.append(merged_cluster)
+
+    return merged
+
+
+def _fallback_clusters(posts: list[dict]) -> list[dict]:
+    """Simple fallback clustering by category when Groq unavailable."""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for post in posts:
+        groups[post.get("category", "viral")].append(post)
+
+    clusters = []
+    for category, group_posts in groups.items():
+        if not group_posts:
+            continue
+        rep = max(group_posts, key=lambda p: p.get("engagement", 0))
+        clusters.append({
+            "theme":            rep.get("title", ""),
+            "category":         category,
+            "posts":            group_posts,
+            "subreddits":       list({p.get("subreddit", "") for p in group_posts}),
+            "total_engagement": sum(p.get("engagement", 0) for p in group_posts),
+            "representative_title": rep.get("title", ""),
+            "post_count":       len(group_posts),
+        })
+    return clusters
+
+
+def generate_content_with_gemini(cluster: dict) -> dict | None:
+    """
+    Use Gemini to generate headline, summary, creator angles and hooks.
+    Called only for high-scoring narratives.
+    """
+    if not config.GEMINI_API_KEY:
+        return None
+
+    top_titles = "\n".join(
+        f"- {p.get('title', '')}"
+        for p in cluster["posts"][:5]
+    )
+
+    prompt = f"""You are the intelligence engine for Spilled, a narrative discovery platform for content creators.
+
+Analyze this emerging internet narrative and generate creator-ready intelligence.
+
+CATEGORY: {cluster['category']}
+STORY SOURCES: {', '.join(cluster['subreddits'][:5])}
+POST COUNT: {cluster['post_count']}
+
+TOP HEADLINES:
+{top_titles}
+
+Return ONLY raw JSON. No markdown. No backticks:
+{{
+  "headline": "One punchy sentence. Max 120 chars. No clickbait.",
+  "summary": "2-3 sentences explaining what's happening and why it's spreading.",
+  "status_label": "EARLY SIGNAL or SPICY or BOILING",
+  "why_spreading": ["Reason 1", "Reason 2", "Reason 3"],
+  "creator_angles": {{
+    "youtube": "Specific video angle",
+    "tiktok": "30-second version of this story",
+    "threads": "Conversational take",
+    "newsletter": "Deep-dive angle",
+    "podcast": "Discussion angle"
+  }},
+  "hooks": {{
+    "curiosity": "Makes people need to know more",
+    "controversy": "Highlights the tension",
+    "explainer": "You as the expert",
+    "creator": "For other creators covering this"
+  }},
+  "opportunity_window": "open or closing or late",
+  "best_format": "youtube or tiktok or threads or newsletter or podcast"
+}}"""
+
+    result = _call_gemini(prompt)
+    if not result:
+        # Fallback to Groq for content generation
+        result = _call_groq(prompt, model="llama3-70b-8192")
+
+    if not result:
+        return None
+
+    return _parse_json(result)
+
+
+def save_narrative_cluster(cluster: dict, content: dict | None = None) -> str | None:
+    """Save a cluster as a narrative to Supabase."""
+    db = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Generate stable ID from theme
+    narrative_id = hashlib.md5(
+        cluster["representative_title"].lower().encode()
+    ).hexdigest()[:16]
+
+    # Check if exists
+    try:
+        existing = db.table("narratives") \
+            .select("id, post_count") \
+            .eq("id", narrative_id) \
+            .execute()
+
+        status_map = {
+            "BOILING": "active",
+            "SPICY": "emerging",
+            "EARLY SIGNAL": "emerging",
+        }
+
+        headline = (content or {}).get("headline") or cluster["representative_title"]
+        summary  = (content or {}).get("summary") or ""
+        status   = status_map.get((content or {}).get("status_label", ""), "emerging")
+        score    = min(50 + cluster["post_count"] * 8, 90)
+
+        row = {
+            "headline":          headline[:500],
+            "summary":           summary[:500],
+            "status":            status,
+            "category":          cluster["category"],
+            "narrative_score":   score,
+            "opportunity_score": (content or {}).get("opportunity_window") == "open" and 80 or 55,
+            "total_engagement":  cluster["total_engagement"],
+            "subreddit_spread":  len(cluster["subreddits"]),
+            "participating_subs": cluster["subreddits"],
+            "post_count":        cluster["post_count"],
+            "last_updated":      now,
+            "last_active":       now,
+            "creator_angles":    (content or {}).get("creator_angles"),
+            "hooks":             (content or {}).get("hooks"),
+            "viral_explanation": (content or {}).get("why_spreading"),
+            "ai_generated_at":   now if content else None,
+            "ai_provider":       "gemini" if content else None,
+        }
+
+        if existing.data:
+            db.table("narratives").update(row).eq("id", narrative_id).execute()
+        else:
+            row["id"] = narrative_id
+            row["first_seen"] = now
+            db.table("narratives").insert(row).execute()
+
+            # Build thread posts
+            thread = []
+            for i, post in enumerate(cluster["posts"][:5]):
+                thread.append({
+                    "story_id":      narrative_id,
+                    "content":       post.get("title", ""),
+                    "source":        post.get("author", post.get("subreddit", "unknown")),
+                    "post_time":     "just now",
+                    "is_developing": i == len(cluster["posts"][:5]) - 1,
+                    "order_index":   i,
+                })
+            if thread:
+                db.table("thread_posts").insert(thread).execute()
+
+        # Link raw posts to narrative
+        post_ids = [p.get("reddit_id") for p in cluster["posts"] if p.get("reddit_id")]
+        if post_ids:
+            db.table("raw_posts").update({"story_id": narrative_id}) \
+                .in_("reddit_id", post_ids).execute()
+
+        return narrative_id
+
+    except Exception as e:
+        logger.error(f"Error saving narrative: {e}")
+        return None
+
+
+def run_clustering_pipeline(posts: list[dict]) -> tuple[int, int]:
+    """
+    Full clustering pipeline:
+    Groq clusters → Gemini generates content → save to Supabase.
+    Returns (created, updated).
+    """
+    if not posts:
+        return 0, 0
+
+    # Step 1: Groq clusters posts into narratives
+    clusters = cluster_with_groq(posts)
+    if not clusters:
+        return 0, 0
+
+    # Step 2: Sort by potential — most posts first
+    clusters.sort(key=lambda c: c["post_count"], reverse=True)
+
+    created = 0
+    updated = 0
+    gemini_calls = 0
+    MAX_GEMINI = 10  # conserve Gemini for top stories
+
+    for cluster in clusters:
+        content = None
+
+        # Use Gemini for top clusters only
+        if gemini_calls < MAX_GEMINI and cluster["post_count"] >= 2:
+            content = generate_content_with_gemini(cluster)
+            if content:
+                gemini_calls += 1
+        elif cluster["post_count"] >= 3:
+            # Use Groq for mid-tier clusters
+            content = generate_content_with_gemini(cluster)  # falls back to Groq internally
+
+        result_id = save_narrative_cluster(cluster, content)
+        if result_id:
+            created += 1
+
+    logger.info(
+        f"Pipeline: {len(clusters)} clusters, {created} saved, "
+        f"{gemini_calls} Gemini calls used"
+    )
+    return created, updated
